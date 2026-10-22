@@ -219,6 +219,162 @@ if __name__ == "__main__":
 
 Para rodar: definir a variável `DATAJUD_API_KEY` com a chave da wiki e executar `python src/coleta.py`. Antes do script completo, vale testar uma consulta com `size: 5` e abrir o JSON para conferir os campos reais.
 
+### 4.1 Atualização depois do teste real da API (usar esta versão)
+
+O teste com a API real mudou a estratégia de coleta; **esta subseção substitui o `coleta.py` e o trecho de recorte do `config.py` acima**.
+
+**O que o teste mostrou:**
+
+- A primeira consulta (ordenada por `@timestamp` crescente) devolvia os primeiros registros carregados na base: processos antigos e **sem o campo `movimentos`**. Sem ele não existem `qtd_movimentos`, `dias_sem_movimento` nem `arquivado`;
+- Com o filtro `exists: movimentos`, o TJSP devolve processos com histórico (83 movimentos no exemplo do JEC de São José do Rio Preto);
+- Consultas com `sort` e contagem total chegaram a dar erro 504 (timeout) ou levar 45 s para 5 processos; sem eles levaram de 14 a 18 s para 2 processos;
+- Sem `sort` não há paginação com `search_after`. A coleta passou a ser **fatiada por trimestre de ajuizamento**, com até 200 processos por trimestre (8 anos x 4 trimestres = no máximo 6.400 processos).
+
+**Limitações que precisam constar no relatório:**
+
+- A amostra só contém processos que têm histórico de movimentos; processos sem esse campo ficam de fora;
+- A API não ordena: a amostra de cada trimestre não é aleatória;
+- Como o número por trimestre é fixo, o gráfico "Processos por ano" reflete o tamanho da amostra e **não o volume real** da comarca; no painel, renomear para "Processos na amostra, por ano" ou remover;
+- Consultas de teste do recorte antigo (sem `exists`) trouxeram processos da Fazenda Pública com assuntos de litigância em massa; com o filtro de movimentos, o recorte passou a ser o Juizado Especial Cível.
+
+`src/config.py` (substitui o anterior):
+
+```python
+from pathlib import Path
+
+TRIBUNAL = "tjsp"
+URL_API = f"https://api-publica.datajud.cnj.jus.br/api_publica_{TRIBUNAL}/_search"
+
+CLASSES = [436]                  # Procedimento do Juizado Especial Cível
+CODIGO_MUNICIPIO_IBGE = 3549805  # São José do Rio Preto
+
+# A coleta é fatiada por trimestre de ajuizamento (sem paginação)
+ANO_INICIO = 2019
+ANO_FIM = 2026
+PROCESSOS_POR_TRIMESTRE = 200
+
+BASE = Path(__file__).resolve().parent.parent
+ARQ_RAW = BASE / "data" / "raw" / "processos_raw.jsonl"
+ARQ_PROCESSADO = BASE / "data" / "processed" / "processos.csv"
+ARQ_AGRUPADO = BASE / "data" / "processed" / "processos_agrupados.csv"
+ARQ_METRICAS = BASE / "data" / "processed" / "metricas_modelo.json"
+```
+
+`src/coleta.py` (substitui o anterior):
+
+```python
+import json
+import os
+import sys
+import time
+
+import requests
+
+from config import (URL_API, CLASSES, CODIGO_MUNICIPIO_IBGE, ANO_INICIO, ANO_FIM,
+                    PROCESSOS_POR_TRIMESTRE, ARQ_RAW)
+
+API_KEY = os.environ.get("DATAJUD_API_KEY")  # só a chave, sem "APIKey"
+if not API_KEY:
+    raise SystemExit("Defina a variável de ambiente DATAJUD_API_KEY")
+
+HEADERS = {"Authorization": f"APIKey {API_KEY}", "Content-Type": "application/json"}
+TRIMESTRES = [("0101", "0331"), ("0401", "0630"), ("0701", "0930"), ("1001", "1231")]
+
+
+def montar_consulta(ano, tri, tamanho):
+    ini, fim = TRIMESTRES[tri]
+    return {
+        "size": tamanho,
+        "track_total_hits": False,  # evita a contagem total, que deixa a API lenta
+        "query": {"bool": {"filter": [
+            {"terms": {"classe.codigo": CLASSES}},
+            {"match": {"orgaoJulgador.codigoMunicipioIBGE": CODIGO_MUNICIPIO_IBGE}},
+            {"exists": {"field": "movimentos"}},
+            {"range": {"dataAjuizamento": {
+                "gte": f"{ano}{ini}000000",
+                "lte": f"{ano}{fim}235959",
+                "format": "yyyyMMddHHmmss"}}},
+        ]}},
+    }
+
+
+def buscar(consulta, tentativas=3):
+    for i in range(tentativas):
+        try:
+            r = requests.post(URL_API, headers=HEADERS, json=consulta, timeout=180)
+            if r.status_code == 400:  # consulta inválida: não adianta repetir
+                raise SystemExit(f"Consulta recusada (400): {r.text[:600]}")
+            r.raise_for_status()
+            return r.json()["hits"]["hits"]
+        except requests.RequestException as erro:
+            print(f"  erro na tentativa {i + 1}: {erro}")
+            time.sleep(10 * (i + 1))
+    return None
+
+
+def testar():
+    """Uma única consulta pequena para conferir filtros e tempo."""
+    inicio = time.time()
+    hits = buscar(montar_consulta(2024, 0, 5))
+    print(f"Tempo: {time.time() - inicio:.1f} s")
+    if hits is None:
+        raise SystemExit("A API não respondeu")
+    print(f"Processos retornados: {len(hits)}")
+    for h in hits:
+        s = h["_source"]
+        print(s.get("numeroProcesso"), s.get("dataAjuizamento"), len(s.get("movimentos") or []), "movimentos")
+
+
+def coletar():
+    ARQ_RAW.parent.mkdir(parents=True, exist_ok=True)
+    vistos, total = set(), 0
+    with open(ARQ_RAW, "w", encoding="utf-8") as arq:
+        for ano in range(ANO_INICIO, ANO_FIM + 1):
+            for tri in range(4):
+                hits = buscar(montar_consulta(ano, tri, PROCESSOS_POR_TRIMESTRE))
+                if hits is None:
+                    print(f"{ano} T{tri + 1}: falhou, seguindo para o próximo")
+                    continue
+                novos = 0
+                for h in hits:
+                    s = h["_source"]
+                    chave = (s.get("numeroProcesso"), s.get("grau"))
+                    if chave in vistos:
+                        continue
+                    vistos.add(chave)
+                    arq.write(json.dumps(s, ensure_ascii=False) + "\n")
+                    novos += 1
+                total += novos
+                print(f"{ano} T{tri + 1}: {novos} processos (acumulado: {total})")
+                time.sleep(2)  # não sobrecarregar a API
+    print(f"Coleta concluída: {total} processos em {ARQ_RAW}")
+
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "teste":
+        testar()
+    else:
+        coletar()
+```
+
+**Como rodar:** primeiro `python src/coleta.py teste` (uma consulta com 5 processos; confere os filtros e o tempo). Se vier dado, rodar `python src/coleta.py`. A coleta completa pode levar de 15 a 30 minutos; o script mostra o andamento a cada trimestre. Erro 400 significa que a API recusou algum filtro (a mensagem aparece no terminal).
+
+**Conferir os códigos de arquivamento:** o `tratamento.py` usa os códigos 246 e 22 (de memória). Depois da coleta, listar os movimentos mais comuns e procurar os que indicam arquivamento ou baixa:
+
+```python
+import json
+from collections import Counter
+
+cont = Counter()
+with open("data/raw/processos_raw.jsonl", encoding="utf-8") as f:
+    for linha in f:
+        for m in json.loads(linha).get("movimentos") or []:
+            cont[(m.get("codigo"), m.get("nome"))] += 1
+
+for (codigo, nome), qtd in cont.most_common(40):
+    print(codigo, nome, qtd)
+```
+
 ## 5. Etapa 2 – Tratamento dos dados
 
 O tratamento transforma cada processo em uma linha com cinco indicadores numéricos e remove registros inválidos ou duplicados. Esses indicadores alimentam tanto o painel quanto o K-Means.
