@@ -228,7 +228,7 @@ O teste com a API real mudou a estratégia de coleta; **esta subseção substitu
 - A primeira consulta (ordenada por `@timestamp` crescente) devolvia os primeiros registros carregados na base: processos antigos e **sem o campo `movimentos`**. Sem ele não existem `qtd_movimentos`, `dias_sem_movimento` nem `arquivado`;
 - Com o filtro `exists: movimentos`, o TJSP devolve processos com histórico (83 movimentos no exemplo do JEC de São José do Rio Preto);
 - Consultas com `sort` e contagem total chegaram a dar erro 504 (timeout) ou levar 45 s para 5 processos; sem eles levaram de 14 a 18 s para 2 processos;
-- Sem `sort` não há paginação com `search_after`. A coleta passou a ser **fatiada por trimestre de ajuizamento**, com até 200 processos por trimestre (8 anos x 4 trimestres = no máximo 6.400 processos).
+- Sem `sort` não há paginação com `search_after`. A coleta passou a ser **fatiada por trimestre de ajuizamento**, com até 100 processos por trimestre (8 anos x 4 trimestres = no máximo 3.200 processos). Detalhe confirmado no teste real: o filtro de data só funcionou \*\*sem\*\* o parâmetro \`format\` (valores no formato \`20240101000000\`); com \`format\` a API devolve 0 processos sem dar erro.
 
 **Limitações que precisam constar no relatório:**
 
@@ -251,7 +251,7 @@ CODIGO_MUNICIPIO_IBGE = 3549805  # São José do Rio Preto
 # A coleta é fatiada por trimestre de ajuizamento (sem paginação)
 ANO_INICIO = 2019
 ANO_FIM = 2026
-PROCESSOS_POR_TRIMESTRE = 200
+PROCESSOS_POR_TRIMESTRE = 100
 
 BASE = Path(__file__).resolve().parent.parent
 ARQ_RAW = BASE / "data" / "raw" / "processos_raw.jsonl"
@@ -292,8 +292,7 @@ def montar_consulta(ano, tri, tamanho):
             {"exists": {"field": "movimentos"}},
             {"range": {"dataAjuizamento": {
                 "gte": f"{ano}{ini}000000",
-                "lte": f"{ano}{fim}235959",
-                "format": "yyyyMMddHHmmss"}}},
+                "lte": f"{ano}{fim}235959"}}},
         ]}},
     }
 
@@ -301,7 +300,7 @@ def montar_consulta(ano, tri, tamanho):
 def buscar(consulta, tentativas=3):
     for i in range(tentativas):
         try:
-            r = requests.post(URL_API, headers=HEADERS, json=consulta, timeout=180)
+            r = requests.post(URL_API, headers=HEADERS, json=consulta, timeout=300)
             if r.status_code == 400:  # consulta inválida: não adianta repetir
                 raise SystemExit(f"Consulta recusada (400): {r.text[:600]}")
             r.raise_for_status()
@@ -346,7 +345,7 @@ def coletar():
                     novos += 1
                 total += novos
                 print(f"{ano} T{tri + 1}: {novos} processos (acumulado: {total})")
-                time.sleep(2)  # não sobrecarregar a API
+                time.sleep(10)  # não sobrecarregar a API (evita erro 429)
     print(f"Coleta concluída: {total} processos em {ARQ_RAW}")
 
 
@@ -396,7 +395,7 @@ O tratamento transforma cada processo em uma linha com cinco indicadores numéri
 - O mesmo número pode aparecer em mais de um grau: manter um registro por processo, de preferência o de 1º grau;
 - As datas podem vir em dois formatos (`20190312000000` ou ISO, como `2019-03-12T00:00:00.000Z`): o código trata os dois.
 
-Os códigos de arquivamento abaixo (246 e 22) vêm de memória da Tabela Processual Unificada: confiram na TPU e olhando os movimentos reais coletados.
+Códigos de arquivamento, conferidos nos 1.388 processos coletados: 22 (Baixa Definitiva), 246 (Definitivo) e 12430 (Arquivamento). Ficaram de fora de propósito o 848 (Trânsito em julgado), porque o processo ainda pode estar em cumprimento de sentença, e o 196 (Extinção da execução), que normalmente é seguido de baixa. Se um processo for reaberto depois da baixa, o script ainda o conta como arquivado; isso é uma simplificação a registrar no relatório.
 
 `src/tratamento.py`:
 
@@ -407,7 +406,7 @@ import pandas as pd
 
 from config import ARQ_RAW, ARQ_PROCESSADO
 
-CODIGOS_ARQUIVAMENTO = {246, 22}  # conferir na TPU
+CODIGOS_ARQUIVAMENTO = {22, 246, 12430}  # Baixa Definitiva, Definitivo, Arquivamento (conferido nos dados coletados)
 
 
 def converter_data(valor):
@@ -565,6 +564,107 @@ if __name__ == "__main__":
 ```
 
 **Como ler a silhueta:** vai de -1 a 1. Acima de 0,5 indica grupos bem separados; entre 0,25 e 0,5, separação razoável; abaixo de 0,25, grupos pouco definidos. A tabela de K testados e o resumo de cada grupo que o script imprime servem direto para a seção de resultados do relatório.
+
+### 6.1 Ajuste depois dos primeiros resultados reais (usar esta versão)
+
+Com os 1.387 processos tratados (575 arquivados e 812 em andamento), o K-Means com K = 3 deu silhueta 0,487 e K = 5 deu 0,513. O problema foi outro: os grupos Rápido, Médio e Lento **não significavam isso**.
+
+- O grupo "Médio" era formado só por processos arquivados (`dias_sem_movimento` zerado no tratamento);
+- O grupo "Rápido" eram processos recentes ainda em andamento: eram novos, e não rápidos;
+- Só o grupo "Lento" (processos antigos e sem movimento recente) tinha utilidade para a gestão.
+
+**Correção:** o K-Means passa a agrupar **só os processos em andamento**; os arquivados entram no painel como grupo à parte ("Arquivado"). Os três grupos viram níveis de atenção (baixa, média e alta), ordenados pela idade do processo e pelo tempo sem movimento. **Esta versão substitui o `src/modelo.py` da seção 6.**
+
+`src/modelo.py`:
+
+```python
+import json
+
+import numpy as np
+import pandas as pd
+from sklearn.cluster import KMeans
+from sklearn.metrics import silhouette_score
+from sklearn.preprocessing import StandardScaler
+
+from config import ARQ_PROCESSADO, ARQ_AGRUPADO, ARQ_METRICAS
+
+VARIAVEIS = ["dias_tramitacao", "qtd_movimentos", "dias_sem_movimento"]
+K_ESCOLHIDO = 3
+NOMES_GRUPOS = {
+    3: ["Atenção baixa", "Atenção média", "Atenção alta"],
+    4: ["Atenção baixa", "Atenção média", "Atenção alta", "Atenção muito alta"],
+}
+
+
+def preparar(df):
+    X = df[VARIAVEIS].fillna(0).clip(lower=0)
+    X = np.log1p(X)  # reduz o efeito de valores muito altos
+    return StandardScaler().fit_transform(X)
+
+
+def testar_k(X, ks=range(2, 7)):
+    resultados = []
+    for k in ks:
+        modelo = KMeans(n_clusters=k, n_init=10, random_state=42).fit(X)
+        resultados.append({"k": k,
+                           "inercia": float(modelo.inertia_),
+                           "silhueta": float(silhouette_score(X, modelo.labels_))})
+        print(f"K={k}  inércia={modelo.inertia_:.1f}  silhueta={resultados[-1]['silhueta']:.3f}")
+    return resultados
+
+
+def agrupar():
+    df = pd.read_csv(ARQ_PROCESSADO, parse_dates=["data_ajuizamento", "data_ultimo_movimento"])
+
+    # O K-Means só olha os processos em andamento; os arquivados já terminaram
+    ativos = df[~df["arquivado"]].copy()
+    X = preparar(ativos)
+    testes = testar_k(X)
+
+    modelo = KMeans(n_clusters=K_ESCOLHIDO, n_init=10, random_state=42).fit(X)
+    ativos["cluster"] = modelo.labels_
+
+    # Ordena os grupos pelo "atraso": idade do processo + tempo sem movimento,
+    # usando os centros do K-Means (já padronizados, então sem empates)
+    idx = [VARIAVEIS.index("dias_tramitacao"), VARIAVEIS.index("dias_sem_movimento")]
+    ordem = np.argsort(modelo.cluster_centers_[:, idx].sum(axis=1))
+    nomes = NOMES_GRUPOS.get(K_ESCOLHIDO, [f"Grupo {i + 1}" for i in range(K_ESCOLHIDO)])
+    ativos["grupo"] = ativos["cluster"].map(dict(zip(ordem, nomes)))
+
+    df["cluster"] = -1
+    df["grupo"] = "Arquivado"
+    df.loc[ativos.index, "cluster"] = ativos["cluster"]
+    df.loc[ativos.index, "grupo"] = ativos["grupo"]
+
+    resumo = ativos.groupby("grupo")[VARIAVEIS].agg(["mean", "median"]).round(1)
+    print(resumo)
+
+    metricas = {
+        "k_escolhido": K_ESCOLHIDO,
+        "processos_agrupados": int(len(ativos)),
+        "processos_arquivados": int((df["grupo"] == "Arquivado").sum()),
+        "silhueta": float(silhouette_score(X, modelo.labels_)),
+        "testes_k": testes,
+        "tamanho_grupos": df["grupo"].value_counts().to_dict(),
+    }
+    df.to_csv(ARQ_AGRUPADO, index=False)
+    with open(ARQ_METRICAS, "w", encoding="utf-8") as arq:
+        json.dump(metricas, arq, ensure_ascii=False, indent=2)
+    print(f"Silhueta final: {metricas['silhueta']:.3f}")
+
+
+if __name__ == "__main__":
+    agrupar()
+```
+
+**Mudanças no `app.py` (seção 7):**
+
+- `ORDEM_GRUPOS = ["Atenção baixa", "Atenção média", "Atenção alta", "Atenção muito alta", "Arquivado"]`;
+- `CORES = {"Atenção baixa": "#2e7d32", "Atenção média": "#f9a825", "Atenção alta": "#c62828", "Atenção muito alta": "#6a1b9a", "Arquivado": "#757575"}`;
+- o quarto indicador passa a ser `c4.metric("Em atenção alta", f"{(f['grupo'].isin(['Atenção alta', 'Atenção muito alta'])).sum():,}".replace(",", "."))`;
+- o título do gráfico por ano passa a ser "Processos na amostra, por ano de ajuizamento", porque o número por trimestre foi limitado na coleta.
+
+**Para o relatório:** onde o texto fala em grupos "rápidos, médios e lentos", trocar por "grupos de atenção baixa, média e alta", e dizer que o agrupamento considera só os processos em andamento. Também registrar que, em processo aberto, o tempo de tramitação mede a idade do processo e não a sua duração total.
 
 ## 7. Etapa 4 – Painel em Streamlit
 

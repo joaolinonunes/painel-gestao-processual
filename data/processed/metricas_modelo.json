@@ -1,0 +1,39 @@
+{
+  "k_escolhido": 3,
+  "processos_agrupados": 812,
+  "processos_arquivados": 575,
+  "silhueta": 0.5302753194844763,
+  "testes_k": [
+    {
+      "k": 2,
+      "inercia": 1404.271168363017,
+      "silhueta": 0.45770856834791057
+    },
+    {
+      "k": 3,
+      "inercia": 750.7235867741166,
+      "silhueta": 0.5302753194844763
+    },
+    {
+      "k": 4,
+      "inercia": 584.0663142035876,
+      "silhueta": 0.41154583870299516
+    },
+    {
+      "k": 5,
+      "inercia": 503.37266741425344,
+      "silhueta": 0.3014042422730804
+    },
+    {
+      "k": 6,
+      "inercia": 438.9387615691323,
+      "silhueta": 0.30055319546834136
+    }
+  ],
+  "tamanho_grupos": {
+    "Arquivado": 575,
+    "Atenção média": 506,
+    "Atenção baixa": 265,
+    "Atenção alta": 41
+  }
+}
