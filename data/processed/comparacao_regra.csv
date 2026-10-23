@@ -1,0 +1,6 @@
+corte_dias_sem_movimento,marcados_pela_regra,marcados_pelo_kmeans,em_comum,so_regra,so_kmeans,sobreposicao_pct
+180,117,41,41,76,0,35.0
+365,44,41,41,3,0,93.2
+730,40,41,40,0,1,97.6
+1000,30,41,30,0,11,73.2
+1095,23,41,23,0,18,56.1

@@ -35,7 +35,7 @@ def testar_k(X, ks=range(2, 7)):
 
 def agrupar():
     df = pd.read_csv(ARQ_PROCESSADO, parse_dates=["data_ajuizamento", "data_ultimo_movimento"],
-                     dtype={"numero_processo": str})
+                     dtype={"numero_processo": str})  # texto: evita perder zeros à esquerda
 
     # O K-Means só olha os processos em andamento; os arquivados já terminaram
     ativos = df[~df["arquivado"]].copy()
@@ -52,10 +52,24 @@ def agrupar():
     nomes = NOMES_GRUPOS.get(K_ESCOLHIDO, [f"Grupo {i + 1}" for i in range(K_ESCOLHIDO)])
     ativos["grupo"] = ativos["cluster"].map(dict(zip(ordem, nomes)))
 
+    # Ranking: 1 = processo que mais merece ser verificado.
+    # Ordem: nível do grupo (alta antes de média antes de baixa) e, dentro do grupo,
+    # índice de atenção (0 a 100) = média dos percentis de idade e de tempo sem movimento.
+    ativos["nivel"] = ativos["grupo"].map({nome: i for i, nome in enumerate(nomes)})
+    ativos["indice_atencao"] = (ativos[["dias_tramitacao", "dias_sem_movimento"]]
+                                .rank(pct=True).mean(axis=1) * 100).round(1)
+    ativos = ativos.sort_values(["nivel", "indice_atencao", "dias_sem_movimento"],
+                                ascending=False)
+    ativos["ranking"] = range(1, len(ativos) + 1)
+
     df["cluster"] = -1
     df["grupo"] = "Arquivado"
+    df["indice_atencao"] = np.nan
+    df["ranking"] = pd.array([pd.NA] * len(df), dtype="Int64")
     df.loc[ativos.index, "cluster"] = ativos["cluster"]
     df.loc[ativos.index, "grupo"] = ativos["grupo"]
+    df.loc[ativos.index, "indice_atencao"] = ativos["indice_atencao"]
+    df.loc[ativos.index, "ranking"] = ativos["ranking"].astype("Int64")
 
     resumo = ativos.groupby("grupo")[VARIAVEIS].agg(["mean", "median"]).round(1)
     print(resumo)
